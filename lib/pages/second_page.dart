@@ -7,7 +7,7 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:image/image.dart' as img;
 import 'dart:ui' as ui;
 import 'dart:typed_data';
-
+import 'dart:math'; // ✅ ADD THIS IMPORT
 
 // ===============================
 //  Data classes (same as before)
@@ -17,7 +17,6 @@ class IsolateInitData {
   final Uint8List modelData;
   IsolateInitData(this.mainSendPort, this.modelData);
 }
-
 
 class IsolateInferenceData {
   final List<Uint8List> planes;
@@ -29,6 +28,52 @@ class IsolateInferenceData {
       this.planes, this.height, this.width, this.uvRowStride, this.uvPixelStride);
 }
 
+// ===================================================
+// --- ✅ NEW: Non-Maximum Suppression Helpers ---
+// ===================================================
+
+/// Calculates the Intersection over Union (IoU) of two bounding boxes.
+double iou(Map<String, dynamic> box1, Map<String, dynamic> box2) {
+  final rect1 = box1['rect'] as Map<String, dynamic>;
+  final rect2 = box2['rect'] as Map<String, dynamic>;
+
+  final double x1 = max(rect1['left'], rect2['left']);
+  final double y1 = max(rect1['top'], rect2['top']);
+  final double x2 = min(rect1['left'] + rect1['width'], rect2['left'] + rect2['width']);
+  final double y2 = min(rect1['top'] + rect1['height'], rect2['top'] + rect2['height']);
+
+  final intersectionArea = max(0, x2 - x1) * max(0, y2 - y1);
+  final box1Area = rect1['width'] * rect1['height'];
+  final box2Area = rect2['width'] * rect2['height'];
+  
+  final unionArea = box1Area + box2Area - intersectionArea;
+
+  return unionArea > 0 ? intersectionArea / unionArea : 0;
+}
+
+/// Applies Non-Maximum Suppression to a list of bounding boxes.
+List<Map<String, dynamic>> nonMaxSuppression(List<Map<String, dynamic>> boxes, double iouThreshold) {
+  if (boxes.isEmpty) return [];
+
+  // Sort boxes by confidence in descending order
+  boxes.sort((a, b) => (b['confidence'] as double).compareTo(a['confidence'] as double));
+
+  final List<Map<String, dynamic>> selected = [];
+  final List<bool> suppressed = List.filled(boxes.length, false);
+
+  for (int i = 0; i < boxes.length; i++) {
+    if (suppressed[i]) continue;
+    selected.add(boxes[i]);
+
+    for (int j = i + 1; j < boxes.length; j++) {
+      if (suppressed[j]) continue;
+      if (iou(boxes[i], boxes[j]) > iouThreshold) {
+        suppressed[j] = true;
+      }
+    }
+  }
+  return selected;
+}
 
 // ===================================================
 // --- Isolate function for YOLO inference ---
@@ -37,7 +82,6 @@ void imageProcessor(IsolateInitData initData) async {
   final mainSendPort = initData.mainSendPort;
   final isolateReceivePort = ReceivePort();
   mainSendPort.send(isolateReceivePort.sendPort);
-
 
   Interpreter? interpreter;
   try {
@@ -48,24 +92,20 @@ void imageProcessor(IsolateInitData initData) async {
     return;
   }
 
-
   const int inputWidth = 640;
   const int inputHeight = 640;
   const int numDetections = 8400;
   final outputShape = [1, 5, numDetections];
-
 
   await for (final IsolateInferenceData isolateData in isolateReceivePort) {
     try {
       final rgbImage = convertFromRawData(isolateData);
       if (rgbImage == null) continue;
 
-
       // Rotate and resize to model input
       final rotated = img.copyRotate(rgbImage, angle: 90);
       final resized =
           img.copyResize(rotated, width: inputWidth, height: inputHeight);
-
 
       // Normalize input
       final input = Float32List(inputWidth * inputHeight * 3);
@@ -76,23 +116,18 @@ void imageProcessor(IsolateInitData initData) async {
         input[idx++] = pixel.b / 255.0;
       }
 
-
       final shapedInput = input.reshape([1, inputHeight, inputWidth, 3]);
       final output =
           List.filled(outputShape.reduce((a, b) => a * b), 0.0).reshape(outputShape);
 
-
       interpreter.run(shapedInput, output);
-
 
       List<Map<String, dynamic>> recognitions = [];
       double maxConf = 0;
 
-
       for (int i = 0; i < numDetections; i++) {
         final conf = output[0][4][i];
         if (conf > maxConf) maxConf = conf;
-
 
         if (conf > 0.2) {
           final cx = output[0][0][i];
@@ -100,12 +135,10 @@ void imageProcessor(IsolateInitData initData) async {
           final w = output[0][2][i];
           final h = output[0][3][i];
 
-
           final left = (cx - w / 2) * inputWidth;
           final top = (cy - h / 2) * inputHeight;
           final width = w * inputWidth;
           final height = h * inputHeight;
-
 
           recognitions.add({
             "rect": {"left": left, "top": top, "width": width, "height": height},
@@ -115,19 +148,22 @@ void imageProcessor(IsolateInitData initData) async {
         }
       }
 
+      // ✅ CHANGE: Apply NMS to the raw recognitions
+      // You can adjust the IoU threshold (0.4 is a good starting point)
+      final List<Map<String, dynamic>> finalDetections = nonMaxSuppression(recognitions, 0.4);
 
+      // ✅ CHANGE: Update the print log
       print("📊 Isolate: Highest confidence = ${(maxConf * 100).toStringAsFixed(2)}% "
-          "(${recognitions.length} detections)");
+          "(${recognitions.length} raw -> ${finalDetections.length} final detections)");
 
-
-      mainSendPort.send(recognitions);
+      // ✅ CHANGE: Send the filtered list to the main thread
+      mainSendPort.send(finalDetections);
     } catch (e) {
       print("❌ Isolate: Error during processing: $e");
       mainSendPort.send([]);
     }
   }
 }
-
 
 // ===================================================
 // --- Convert YUV420 → RGB ---
@@ -137,12 +173,9 @@ img.Image? convertFromRawData(IsolateInferenceData data) {
     final width = data.width;
     final height = data.height;
     final imgImage = img.Image(width: width, height: height);
-
-
     final yPlane = data.planes[0];
     final uPlane = data.planes[1];
     final vPlane = data.planes[2];
-
 
     for (int y = 0; y < height; y++) {
       final uvRow = (y / 2).floor();
@@ -151,26 +184,21 @@ img.Image? convertFromRawData(IsolateInferenceData data) {
         final uvIndex = uvRow * data.uvRowStride + uvCol * data.uvPixelStride;
         final index = y * width + x;
 
-
         if (uvIndex >= uPlane.length ||
             uvIndex >= vPlane.length ||
             index >= yPlane.length) continue;
-
 
         final yp = yPlane[index].toDouble();
         final up = uPlane[uvIndex].toDouble() - 128.0;
         final vp = vPlane[uvIndex].toDouble() - 128.0;
 
-
         int r = (yp + 1.402 * vp).round().clamp(0, 255);
         int g = (yp - 0.344136 * up - 0.714136 * vp).round().clamp(0, 255);
         int b = (yp + 1.772 * up).round().clamp(0, 255);
 
-
         imgImage.setPixelRgba(x, y, r, g, b, 255);
       }
     }
-
 
     return imgImage;
   } catch (e) {
@@ -178,7 +206,6 @@ img.Image? convertFromRawData(IsolateInferenceData data) {
     return null;
   }
 }
-
 
 // ===================================================
 // --- Main Page (Responsive full-screen preview) ---
@@ -291,46 +318,41 @@ class _MySecondPageState extends State<MySecondPage> with WidgetsBindingObserver
 
   @override
   Widget build(BuildContext context) {
-  if (_cameraController == null || !_cameraController!.value.isInitialized) {
-    return const Scaffold(body: Center(child: CircularProgressIndicator()));
-  }
+    if (_cameraController == null || !_cameraController!.value.isInitialized) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
 
-  final screenSize = MediaQuery.of(context).size;
-  final previewSize = _cameraController!.value.previewSize!;
+    final screenSize = MediaQuery.of(context).size;
+    final previewSize = _cameraController!.value.previewSize!;
 
-  return Scaffold(
-    backgroundColor: Colors.black,
-    appBar: AppBar(title: const Text("License Plate Detection")),
-    body: Center(
-      child: SizedBox(
-        width: screenSize.width,
-        height: screenSize.width, // This creates the square constraint
-        
-        // ✅ Wrap the Stack with a ClipRect. This is the crucial fix.
-        // It will clip the overflowing parts of the CameraPreview.
-        child: ClipRect(
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              // Camera preview will now be clipped to the square SizedBox
-              FittedBox(
-                fit: BoxFit.cover,
-                child: SizedBox(
-                  width: previewSize.height,
-                  height: previewSize.width,
-                  child: CameraPreview(_cameraController!),
-                ),
-              ),
-
-              // Draw bounding boxes
-              if (_recognitions != null)
-                CustomPaint(
-                  painter: BoundingBoxPainter(
-                    recognitions: _recognitions!,
-                    modelInputSize: const Size(640, 640),
-                    previewScreenSize: Size(screenSize.width, screenSize.width),
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(title: const Text("License Plate Detection")),
+      body: Center(
+        child: SizedBox(
+          width: screenSize.width,
+          height: screenSize.width, // This creates the square constraint
+          child: ClipRect(
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                FittedBox(
+                  fit: BoxFit.cover,
+                  child: SizedBox(
+                    width: previewSize.height,
+                    height: previewSize.width,
+                    child: CameraPreview(_cameraController!),
                   ),
                 ),
+                if (_recognitions != null)
+                  CustomPaint(
+                    painter: BoundingBoxPainter(
+                      recognitions: _recognitions!,
+                      modelInputSize: const Size(640, 640),
+                      previewScreenSize:
+                          Size(screenSize.width, screenSize.width),
+                    ),
+                  ),
               ],
             ),
           ),
@@ -366,17 +388,12 @@ class BoundingBoxPainter extends CustomPainter {
     for (var recognition in recognitions) {
       final rect = recognition['rect'] as Rect;
 
-      // ✅ CORRECTED LOGIC: Simply scale the coordinates. No rotation needed.
-      // The coordinate system of the model (after your 90-degree rotation)
-      // and the coordinate system of the canvas are now the same.
       final double left = rect.left * scale;
       final double top = rect.top * scale;
       final double width = rect.width * scale;
       final double height = rect.height * scale;
 
       final scaledRect = Rect.fromLTWH(left, top, width, height);
-
-      // Draw the scaled rectangle
       canvas.drawRect(scaledRect, paint);
 
       final textPainter = TextPainter(
@@ -392,7 +409,6 @@ class BoundingBoxPainter extends CustomPainter {
         textDirection: ui.TextDirection.ltr,
       );
       textPainter.layout(minWidth: 0, maxWidth: previewScreenSize.width);
-      // Use the new scaledRect coordinates to position the label
       textPainter.paint(canvas, Offset(scaledRect.left, scaledRect.top - 20));
     }
   }
